@@ -49,12 +49,24 @@ def stock_directory_message(udp_data, offset):
         return None, len(udp_data)
 
     temp = struct.unpack_from(">HH6s8scc", udp_data, offset)
+
+    stock_raw_data = udp_data[offset + 12:offset + 20]  # Slice 8 bytes representing stock symbol
+
+    try:
+        stock = stock_raw_data.decode('ascii').strip() 
+        print(f"Stock symbol: {stock}")
+    except UnicodeDecodeError as e:
+        print(f"Error decoding stock symbol: {e}")
+        stock = ""
+
+    
     return {
         "msg_type": "R",
         "stock_locate": temp[0],
         "tracking_number": temp[1],
         "timestamp": struct.unpack(">Q", b"\x00\x00" + udp_data[offset + 4:offset + 10])[0],
-        "stock": temp[3].decode('ascii', errors='ignore').strip(),
+        # "stock": temp[3].decode('ascii', errors='ignore').strip(),
+        "stock": stock,
         "market_category": byte_to_char(temp[4]),
         "financial_status_indicator": byte_to_char(temp[5])
     }, offset + expected_length
@@ -71,7 +83,7 @@ def add_order_no_mpid(udp_data, offset):
         print(f"[DEBUG] Remaining payload (hex): {udp_data[offset:].hex()}")
         return None, len(udp_data)
 
-    temp = struct.unpack_from(">HH6sQIc8s", udp_data, offset)
+    temp = struct.unpack_from(">HH6sQIc8sI", udp_data, offset)
 
     stock_locate = temp[0]
     tracking_number = temp[1]
@@ -84,8 +96,8 @@ def add_order_no_mpid(udp_data, offset):
     print(f"[DEBUG] Parsed shares field: {shares} (raw: {shares_raw_data})")
 
     stock = temp[6].decode('ascii', errors='ignore').strip()
-    price = struct.unpack_from(">I", udp_data, offset + 29)[0] / 10000.0  # Price starts at offset 29
-
+    # price = struct.unpack_from(">I", udp_data, offset + 29)[0] / 10000.0  # Price starts at offset 29
+    price = temp[7]/10000.0
     return {
         "msg_type": "A",
         "stock_locate": stock_locate,
@@ -286,7 +298,7 @@ def byte_to_char(byte_value):
         raise TypeError(f"Unexpected type {type(byte_value)} for single-byte value.")
 
 if __name__ == '__main__':
-    input_pcap = 'C:\\Users\\dansi\\OneDrive\\School\\CS\\HFT\\HFTRepo\\sample_NASDAQ_ITCH.pcap' 
+    input_pcap = '/Users/rishimulchandani/local_nasdaq_decoder/rishi-pcap-decoder/ny4-xnas-tvitch-a-20230822T133000.pcap' 
     output_csv = 'decoded_messages.csv'
-    packet_limit = 100  # Set the packet limit to the first 100 packets
+    packet_limit = 10000  # Set the packet limit to the first 100 packets
     decode_pcap_itch(input_pcap, output_csv, packet_limit)
