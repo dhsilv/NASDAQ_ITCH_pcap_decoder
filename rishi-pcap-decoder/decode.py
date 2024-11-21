@@ -1,110 +1,97 @@
-from scapy.all import rdpcap
-import struct
+import dpkt
 import csv
+import struct
+from dataclasses import dataclass
 
+@dataclass
+class Message:
+    msg_type: str
+    fields: dict
 
-def parse_add_order_no_mpid(data):
+def find_start_of_itch_message(udp_data, offset=0):
+    """Locate a valid ITCH message type at or after the current offset."""
+    valid_msg_types = {'S', 'R', 'A', 'E', 'C', 'P', 'Q', 'H', 'Y', 'V', 'W', 'K', 'J', 'h'}
+    while offset < len(udp_data):
+        potential_type = udp_data[offset:offset + 1].decode('ascii', errors='ignore')
+        if potential_type in valid_msg_types:
+            return offset  # Found a valid ITCH message type
+        offset += 1
+    return None  # No valid ITCH message type found
 
-    message_type, stock_locate, tracking_number, timestamp, order_ref, \
-    buy_sell_indicator, shares, stock, price = struct.unpack('!cHHLQ1sI8sI', data)
-    return {
-        "message_type": message_type.decode(),
-        "stock_locate": stock_locate,
-        "tracking_number": tracking_number,
-        "timestamp": timestamp,
-        "order_ref": order_ref,
-        "buy_sell_indicator": buy_sell_indicator.decode(),
-        "shares": shares,
-        "stock": stock.decode().strip(),
-        "price": price / 10000  
-    }
+def parse_itch_message(udp_data, offset=0):
+    """Parse an individual ITCH message from the given UDP payload data starting at the specified offset."""
+    offset = find_start_of_itch_message(udp_data, offset)
+    if offset is None:
+        return None, len(udp_data)  # End of valid messages in the payload
 
-def parse_modify_order(data):
+    msg_type = udp_data[offset:offset + 1].decode('ascii')
+    offset += 1
 
-    message_type, stock_locate, tracking_number, timestamp, order_ref, \
-    shares, price = struct.unpack('!cHHLQI', data)
-    return {
-        "message_type": message_type.decode(),
-        "stock_locate": stock_locate,
-        "tracking_number": tracking_number,
-        "timestamp": timestamp,
-        "order_ref": order_ref,
-        "shares": shares,
-        "price": price / 10000  
-    }
+    fields = {"msg_type": msg_type}
 
-def parse_delete_order(data):
+    if msg_type == "S":  # System Event Message
+        fields.update({
+            "stock_locate": struct.unpack_from(">H", udp_data, offset)[0],
+            "tracking_number": struct.unpack_from(">H", udp_data, offset + 2)[0],
+            "timestamp": struct.unpack_from(">Q", b'\x00\x00' + udp_data[offset + 4:offset + 10])[0],
+            "event_code": udp_data[offset + 10:offset + 11].decode('ascii', errors='ignore')
+        })
+        offset += 11
 
-    message_type, stock_locate, tracking_number, timestamp, order_ref = struct.unpack('!cHHLQ', data)
-    return {
-        "message_type": message_type.decode(),
-        "stock_locate": stock_locate,
-        "tracking_number": tracking_number,
-        "timestamp": timestamp,
-        "order_ref": order_ref
-    }
+    elif msg_type == "R":  # Stock Directory Message
+        fields.update({
+            "stock_locate": struct.unpack_from(">H", udp_data, offset)[0],
+            "tracking_number": struct.unpack_from(">H", udp_data, offset + 2)[0],
+            "timestamp": struct.unpack_from(">Q", b'\x00\x00' + udp_data[offset + 4:offset + 10])[0],
+            "stock": udp_data[offset + 10:offset + 18].decode('ascii', errors='ignore').strip(),
+            "market_category": udp_data[offset + 18:offset + 19].decode('ascii', errors='ignore'),
+            "financial_status_indicator": udp_data[offset + 19:offset + 20].decode('ascii', errors='ignore'),
+        })
+        offset += 39
 
-def parse_trade_execution(data):
+    # Add additional ITCH message types here as needed
 
-    message_type, stock_locate, tracking_number, timestamp, order_ref, \
-    shares, price = struct.unpack('!cHHLQIQ', data)
-    return {
-        "message_type": message_type.decode(),
-        "stock_locate": stock_locate,
-        "tracking_number": tracking_number,
-        "timestamp": timestamp,
-        "order_ref": order_ref,
-        "shares": shares,
-        "price": price / 10000  
-    }
+    return Message(msg_type, fields), offset
 
+def decode_pcap_itch(file_path, output_csv, packet_limit=100):
+    """Decode ITCH messages from a PCAP file and output to a CSV."""
+    with open(file_path, 'rb') as f:
+        pcap = dpkt.pcap.Reader(f)
+        with open(output_csv, 'w', newline='') as csv_file:
+            csv_writer = csv.writer(csv_file)
+            csv_writer.writerow(['msg_type', 'fields'])
 
-packets = rdpcap("subset.pcap")
-parsed_messages = []
+            packet_count = 0
+            for timestamp, buf in pcap:
+                if packet_count >= packet_limit:
+                    break
 
-for packet in packets:
+                eth = dpkt.ethernet.Ethernet(buf)
+                if not isinstance(eth.data, dpkt.ip.IP):
+                    continue
 
-    if packet.haslayer('UDP'):
-        payload = bytes(packet['UDP'].payload) 
-        print(f"Packet length: {len(payload)} bytes")
-        print(f"Payload: {payload[:40]}...") 
+                ip = eth.data
+                if not isinstance(ip.data, dpkt.udp.UDP):
+                    continue
 
-        if len(payload) > 0:
-            message_type = payload[0:1] 
-            print(f"Message Type: {message_type}")
+                udp = ip.data
+                udp_data = udp.data
 
-            try:
-                if message_type == b'A':  # Add Order - No MPID Attribution
-                    parsed_message = parse_add_order_no_mpid(payload)
-                elif message_type == b'U':  # Modify Order
-                    parsed_message = parse_modify_order(payload)
-                elif message_type == b'D':  # Delete Order
-                    parsed_message = parse_delete_order(payload)
-                elif message_type == b'P':  # Trade Execution
-                    parsed_message = parse_trade_execution(payload)
-                else:
-                    print(f"Unsupported message type: {message_type}")
-                    continue  
+                print(f"\n[DEBUG] Packet #{packet_count + 1} at timestamp {timestamp}. Payload length: {len(udp_data)}")
+                print(f"[DEBUG] Payload (hex): {udp_data.hex()}")
 
+                offset = 0
+                while offset < len(udp_data):
+                    message, offset = parse_itch_message(udp_data, offset)
+                    if message is None:
+                        break
+                    csv_writer.writerow([message.msg_type, message.fields])
 
-                parsed_messages.append(parsed_message)
-            except struct.error as e:
-                print(f"Error parsing message of type {message_type.decode()}: {e}")
-                print(f"Problematic payload: {payload}")
-                continue
+                packet_count += 1
 
+        print(f"\n[INFO] Decoding complete. Output saved to {output_csv}. Parsed {packet_count} packets.")
 
-with open("parsed_itch_messages.csv", "w", newline="") as csvfile:
-
-    fieldnames = ["message_type", "stock_locate", "tracking_number", "timestamp",
-                  "order_ref", "buy_sell_indicator", "shares", "stock", "price"]
-    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-
-
-    writer.writeheader()
-
-
-    for message in parsed_messages:
-        writer.writerow(message)
-
-print("Parsed messages have been written to parsed_itch_messages.csv")
+if __name__ == '__main__':
+    input_pcap = 'ny4-xnas-tvitch-a-20230822T133000.pcap'  # Replace with your actual input PCAP file
+    output_csv = 'decoded_messages.csv'
+    decode_pcap_itch(input_pcap, output_csv)
