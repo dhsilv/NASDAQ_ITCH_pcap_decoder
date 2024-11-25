@@ -20,13 +20,11 @@ def find_start_of_itch_message(udp_data, offset):
     """Locate a valid ITCH message type at or after the current offset."""
     while offset < len(udp_data):
         potential_type = udp_data[offset:offset + 1].decode('ascii', errors='ignore')
+        # Avoid marking non-message-type bytes as invalid prematurely
         if potential_type in {'S', 'R', 'A', 'E', 'C', 'P', 'Q', 'H', 'Y', 'V', 'W', 'K', 'J', 'h'}:
             print(f"[DEBUG] Found valid message type '{potential_type}' at offset {offset}")
             return offset
-        else:
-            print(f"[WARN] Skipping invalid byte '{udp_data[offset:offset + 1].hex()}' at offset {offset}")
         offset += 1
-    print("[ERROR] No valid ITCH message type found in payload.")
     return None
 
 def system_event_message(udp_data, offset):
@@ -49,12 +47,24 @@ def stock_directory_message(udp_data, offset):
         return None, len(udp_data)
 
     temp = struct.unpack_from(">HH6s8scc", udp_data, offset)
+
+    stock_raw_data = udp_data[offset + 12:offset + 20]  # Slice 8 bytes representing stock symbol
+
+    try:
+        stock = stock_raw_data.decode('ascii').strip() 
+        print(f"Stock symbol: {stock}")
+    except UnicodeDecodeError as e:
+        print(f"Error decoding stock symbol: {e}")
+        stock = ""
+
+    
     return {
         "msg_type": "R",
         "stock_locate": temp[0],
         "tracking_number": temp[1],
         "timestamp": struct.unpack(">Q", b"\x00\x00" + udp_data[offset + 4:offset + 10])[0],
-        "stock": temp[3].decode('ascii', errors='ignore').strip(),
+        # "stock": temp[3].decode('ascii', errors='ignore').strip(),
+        "stock": stock,
         "market_category": byte_to_char(temp[4]),
         "financial_status_indicator": byte_to_char(temp[5])
     }, offset + expected_length
@@ -63,40 +73,57 @@ def add_order_no_mpid(udp_data, offset):
     """
     Parse the 'A' (Add Order No MPID) message according to the ITCH protocol.
     """
-    expected_length = 36  # Total length of the A message according to the schema - might need to change this havnig issue
+    expected_length = 36  # Total length of the A message according to the schema
     remaining_bytes = len(udp_data) - offset
 
+    # Check for sufficient bytes to parse the message
     if remaining_bytes < expected_length:
         print(f"[ERROR] Insufficient bytes for 'A' message: needed {expected_length}, but only {remaining_bytes} available at offset {offset}.")
         print(f"[DEBUG] Remaining payload (hex): {udp_data[offset:].hex()}")
         return None, len(udp_data)
 
-    temp = struct.unpack_from(">HH6sQIc8s", udp_data, offset)
+    # Unpack fields using the ITCH specification
+    try:
+        temp = struct.unpack_from(">HH6sQIc8sI", udp_data, offset)
 
-    stock_locate = temp[0]
-    tracking_number = temp[1]
-    timestamp = struct.unpack(">Q", b"\x00\x00" + temp[2])[0]
-    order_ref_number = temp[3]
-    buy_sell_indicator = byte_to_char(temp[4])
+        # Decode fields
+        stock_locate = temp[0]
+        tracking_number = temp[1]
+        timestamp = struct.unpack(">Q", b"\x00\x00" + temp[2])[0]  # Add padding for 6-byte timestamp
+        order_ref_number = temp[3]
+        buy_sell_indicator = byte_to_char(temp[4])
 
-    shares_raw_data = udp_data[offset + 21:offset + 25]
-    shares = int.from_bytes(shares_raw_data, byteorder='big', signed=False)
-    print(f"[DEBUG] Parsed shares field: {shares} (raw: {shares_raw_data})")
+        # Parse shares (4 bytes starting at offset 21)
+        shares_raw_data = udp_data[offset + 21:offset + 25]
+        shares = int.from_bytes(shares_raw_data, byteorder='big', signed=False)
+        print(f"[DEBUG] Parsed shares field: {shares} (raw: {shares_raw_data.hex()})")
 
-    stock = temp[6].decode('ascii', errors='ignore').strip()
-    price = struct.unpack_from(">I", udp_data, offset + 29)[0] / 10000.0  # Price starts at offset 29
+        # Parse stock (8-byte field at offset 25)
+        stock = temp[6].decode('ascii', errors='ignore').strip()
 
-    return {
-        "msg_type": "A",
-        "stock_locate": stock_locate,
-        "tracking_number": tracking_number,
-        "timestamp": timestamp,
-        "order_ref_number": order_ref_number,
-        "buy_sell_indicator": buy_sell_indicator,
-        "shares": shares,
-        "stock": stock,
-        "price": price
-    }, offset + expected_length
+        # Parse price (4 bytes starting at offset 29)
+        price = temp[7] / 10000.0  # Divide by 10,000 to get decimal representation
+
+        # Log successful parsing
+        print(f"[DEBUG] Parsed message - Stock: {stock}, Shares: {shares}, Price: {price}, Buy/Sell: {buy_sell_indicator}")
+
+        # Return parsed message as a dictionary
+        return {
+            "msg_type": "A",
+            "stock_locate": stock_locate,
+            "tracking_number": tracking_number,
+            "timestamp": timestamp,
+            "order_ref_number": order_ref_number,
+            "buy_sell_indicator": buy_sell_indicator,
+            "shares": shares,
+            "stock": stock,
+            "price": price
+        }, offset + expected_length
+
+    except struct.error as e:
+        print(f"[ERROR] Struct unpacking failed at offset {offset}: {e}")
+        print(f"[DEBUG] Remaining payload (hex): {udp_data[offset:].hex()}")
+        return None, len(udp_data)
 
 def order_executed_message(udp_data, offset):
     """
@@ -149,6 +176,72 @@ def order_executed_message(udp_data, offset):
         "match_number": temp[5]
     }, offset + expected_length
 
+def cross_trade_message(udp_data, offset):
+    """
+    Parse the 'Q' (Cross Trade) message according to the ITCH protocol.
+    """
+    expected_length = 40  # Total length of the Q message
+    remaining_bytes = len(udp_data) - offset
+
+    # Validate message length
+    if remaining_bytes < expected_length:
+        print(f"[ERROR] Insufficient bytes for 'Q' message: needed {expected_length}, but only {remaining_bytes} available at offset {offset}.")
+        print(f"[DEBUG] Remaining payload (hex): {udp_data[offset:].hex()}")
+        return None, len(udp_data)
+
+    try:
+        # Parse fixed-length fields
+        stock_locate = int.from_bytes(udp_data[offset + 1:offset + 3], byteorder="big", signed=False)
+        tracking_number = int.from_bytes(udp_data[offset + 3:offset + 5], byteorder="big", signed=False)
+        timestamp = int.from_bytes(udp_data[offset + 5:offset + 11], byteorder="big", signed=False)
+
+        # Parse shares (8 bytes)
+        shares_raw = udp_data[offset + 11:offset + 19]
+        shares = int.from_bytes(shares_raw, byteorder="big", signed=False)
+        print(f"[DEBUG] Parsed shares field: {shares} (raw: {shares_raw.hex()})")
+
+        # Parse stock (8 bytes)
+        stock_raw = udp_data[offset + 19:offset + 27]
+        stock = stock_raw.decode('ascii', errors='ignore').strip()
+        print(f"[DEBUG] Parsed stock field: {stock} (raw: {stock_raw.hex()})")
+
+        # Parse cross price (4 bytes)
+        cross_price_raw = udp_data[offset + 27:offset + 31]
+        cross_price = int.from_bytes(cross_price_raw, byteorder="big", signed=False) / 10000.0
+        print(f"[DEBUG] Parsed cross price field: {cross_price} (raw: {cross_price_raw.hex()})")
+
+        # Parse match number (8 bytes)
+        match_number_raw = udp_data[offset + 31:offset + 39]
+        match_number = int.from_bytes(match_number_raw, byteorder="big", signed=False)
+        print(f"[DEBUG] Parsed match number field: {match_number} (raw: {match_number_raw.hex()})")
+
+        # Parse cross type (1 byte)
+        cross_type_raw = udp_data[offset + 39:offset + 40]
+        cross_type = cross_type_raw.decode('ascii', errors='ignore').strip()
+        print(f"[DEBUG] Parsed cross type field: {cross_type} (raw: {cross_type_raw.hex()})")
+
+        # Log debug output for the full message
+        print(f"[DEBUG] Parsed Q message - Stock: {stock}, Shares: {shares}, Cross Price: {cross_price}, Match Number: {match_number}, Cross Type: {cross_type}")
+
+        # Return parsed message
+        return {
+            "msg_type": "Q",
+            "stock_locate": stock_locate,
+            "tracking_number": tracking_number,
+            "timestamp": timestamp,
+            "shares": shares,
+            "stock": stock,
+            "cross_price": cross_price,
+            "match_number": match_number,
+            "cross_type": cross_type
+        }, offset + expected_length
+
+    except Exception as e:
+        print(f"[ERROR] Parsing failed for 'Q' message at offset {offset}: {e}")
+        print(f"[DEBUG] Remaining payload (hex): {udp_data[offset:].hex()}")
+        return None, len(udp_data)
+
+
 def parse_itch_message(udp_data, offset=0):
     remaining_bytes = len(udp_data) - offset
     if remaining_bytes < 1:
@@ -166,6 +259,9 @@ def parse_itch_message(udp_data, offset=0):
         return add_order_no_mpid(udp_data, offset)
     elif msg_type == "E":
         return order_executed_message(udp_data, offset)
+    elif msg_type == "Q":
+        return cross_trade_message(udp_data, offset)
+
     else:
         print(f"[WARN] Unknown message type: {msg_type} at offset {offset - 1}")
         return None, len(udp_data)
