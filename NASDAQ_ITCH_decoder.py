@@ -58,11 +58,24 @@ def stock_directory_message(udp_data, offset):
         stock = ""
 
     
+
+    stock_raw_data = udp_data[offset + 12:offset + 20]  # Slice 8 bytes representing stock symbol
+
+    try:
+        stock = stock_raw_data.decode('ascii').strip() 
+        print(f"Stock symbol: {stock}")
+    except UnicodeDecodeError as e:
+        print(f"Error decoding stock symbol: {e}")
+        stock = ""
+
+    
     return {
         "msg_type": "R",
         "stock_locate": temp[0],
         "tracking_number": temp[1],
         "timestamp": struct.unpack(">Q", b"\x00\x00" + udp_data[offset + 4:offset + 10])[0],
+        # "stock": temp[3].decode('ascii', errors='ignore').strip(),
+        "stock": stock,
         # "stock": temp[3].decode('ascii', errors='ignore').strip(),
         "stock": stock,
         "market_category": byte_to_char(temp[4]),
